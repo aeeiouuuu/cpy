@@ -1,213 +1,263 @@
-"""collectors/public_traffic.py
+"""main.py
 
-京橋オフィス通勤者向けの交通・気象警報情報を2種類取得する。category="weather"として、
-既存の「☀️ 天候と交通」枠にそのまま統合する（public_weather.pyの天気予報と合わせて表示される）。
+夕方サマリー自動生成アシスタントのメイン実行スクリプト。
 
-1. 気象庁 警報・注意報（台風・大雨・大雪など、在宅勤務/出社判断に関わるもの）
-   - API: https://www.jma.go.jp/bosai/warning/data/warning/{area_code}.json
-   - 認証不要・無料の官公庁公開データ。public_weather.pyと同じ大阪府コード(270000)を既定値とする
-     （気象庁APIは市区町村単位の粒度を提供していないため）。
-   - warnings配列の中から、台風・大雪関連の警報コードのみを対象に、statusが「解除」
-     「発表警報・注意報はなし」以外（＝現在発表中）のものを拾う。
+流れ:
+1. config/settings.yaml を読み込む
+2. 各 collectors/*.py の collect() を呼び出して Item を集約する（天気・今日は何の日など）
+   ※ ITmediaニュースはここには含めない（後述）
+3. core/px_ai_client.py 経由でAI（PX-AI）にサマリー生成を依頼する
+   - AI呼び出しに失敗した場合（エンドポイント未確認・ネットワーク不通など）は、
+     Itemをカテゴリ別にそのまま並べる簡易フォーマットにフォールバックする
+4. ITmediaニュースを、AIを経由せず固定で3件、末尾にそのまま追加する
+   （旧Power Automateでのそのまま配信運用に合わせた形。見出し・本文はAIに要約させない）
+5. out/draft_YYYYMMDD.md として下書きを書き出す
 
-2. JR西日本 運行情報（大阪環状線・JR東西線）
-   - API: https://trafficinfo.westjr.co.jp/api/v1/trafficinfo.json
-   - JR西日本の公式サイト(trafficinfo.westjr.co.jp)が自身のページ描画に使っている
-     一般公開JSON（認証不要）。dailyDataに当日を含め数日分（今日・明日・明後日）の
-     情報が入っており、明日分の計画運休・工事等の告知があれば拾える。
-     ただし突発的な当日朝の遅延・事故等は当然ながら前日時点では予測できない
-     （このcollectorが拾えるのは「あらかじめ判明している」情報のみ）。
-   - 平常運転の路線はJSON内に一切登場しない、という設計を確認済み（該当が無ければ
-     何も出力しない＝他のcollectorと同じ方針）。
-   - 【利用規約について】trafficinfo.westjr.co.jpの利用規約には「本サービスを個人的な
-     利用範囲を超えて、許可なく商業・営利目的において利用する行為」「当社に無断で複製・
-     送信等を行う行為」を禁止する条項がある。本ツールは社内の少人数チーム向け、非営利の
-     情報共有目的であることを前提に、利用者の判断で有効化している
-     （config/settings.yaml の traffic.jr_west.enabled で無効化可能）。
+【注意】「📰 注目ニュース」カテゴリ（CATEGORY_LABELSの"news"）は、今後
+internal_news.py（社内イントラ）を実装した際に使う想定に変更した。一般公開の
+ニュース(Google News等)は、末尾に固定で追加するITmediaニュースでカバーする。
+collectors/public_news.py 自体は削除していない（再利用したくなった場合のため）が、
+現在main.pyからは呼んでいない。
 
-【設計メモ】このファイルは2つの独立した外部APIを叩くため、他のcollectorと異なり
-ソースごとに個別のtry/exceptで保護している（片方のAPIが落ちていても、もう片方の
-結果は失わないようにするため）。最終的にcollect()全体は失敗しても[]を返す。
+【社用PCでのSSL証明書エラーについて】
+社内プロキシ(WARP等)がTLS通信を検査する構成の場合、Pythonの`requests`は
+社内ルート証明書を知らないため、天気・今日は何の日・ITmedia・PX-AIなど、
+すべての外部通信がSSLエラーで失敗する（＝collector側のtry/exceptで握りつぶされ、
+エラー表示なしに情報0件になる）ことが確認されている。対策として、Windowsが
+信頼している証明書ストアをPythonにもそのまま使わせる`truststore`パッケージを
+requestsより先にimportして有効化している（下記参照）。
 """
 
 from __future__ import annotations
 
+# 社内プロキシ等によるTLS通信の検査（証明書の差し替え）でSSL証明書エラーになる場合の対策。
+# Windowsの証明書ストア（会社のルート証明書を含む）をPythonのssl検証にも使わせるようにする。
+# requestsなど、ssl/httpsを使うモジュールをimportするより前に呼び出す必要がある。
+import truststore
+
+truststore.inject_into_ssl()
+
+import argparse
 import datetime as dt
-from typing import Optional
+from pathlib import Path
 
-import requests
+import yaml
 
-from .base import Item
+from dotenv import load_dotenv
 
-REQUEST_TIMEOUT_SECONDS = 10
+from collectors import (
+    internal_birthday,
+    internal_calendar,
+    public_anniversary,
+    public_itmedia,
+    public_traffic,
+    public_weather,
+)
+from collectors.base import Item
+from core import px_ai_client
 
-# --- 気象庁 警報・注意報 ---
+ROOT = Path(__file__).parent
+CONFIG_DIR = ROOT / "config"
+OUT_DIR = ROOT / "out"
 
-JMA_WARNING_URL = "https://www.jma.go.jp/bosai/warning/data/warning/{area_code}.json"
-DEFAULT_JMA_AREA_CODE = "270000"  # 大阪府（public_weather.pyと同じ粒度）
+load_dotenv(ROOT / ".env")  # .envがあれば環境変数として読み込む（無くてもエラーにはしない）
 
-# 現在発表中とみなさないstatus値（このいずれか以外なら「発表中」として扱う）
-_INACTIVE_STATUSES = {"解除", "発表警報・注意報はなし"}
-
-# 台風・大雨・大雪など、在宅勤務/出社判断に関わる警報・注意報コードのみを対象にする
-# （気象庁防災情報XMLフォーマットのコード管理表に基づく。全種類ではなく抜粋）
-_RELEVANT_WARNING_CODES = {
-    "02": "暴風雪警報",
-    "03": "大雨警報",
-    "05": "暴風警報",
-    "06": "大雪警報",
-    "07": "波浪警報",
-    "08": "高潮警報",
-    "32": "暴風雪特別警報",
-    "33": "大雨特別警報",
-    "35": "暴風特別警報",
-    "36": "大雪特別警報",
-    "37": "波浪特別警報",
-    "38": "高潮特別警報",
-    "12": "大雪注意報",
-    "13": "風雪注意報",
-    "15": "強風注意報",
+CATEGORY_LABELS = {
+    "weather": "☀️ 天候と交通",
+    "schedule": "🗓️ 明日の予定・期限",
+    "celebration": "🎂 お祝い・その他",
+    "news": "📰 注目ニュース",  # 今後internal_news.py(社内イントラ)向け。現状は使用するcollectorなし
 }
+CATEGORY_ORDER = ["weather", "schedule", "celebration", "news"]
+
+ITMEDIA_HEADING = "### 📰 ITmediaニュース"
 
 
-def _collect_jma_warnings(config: dict) -> list[Item]:
-    area_code = config.get("jma_area_code", DEFAULT_JMA_AREA_CODE)
-    url = JMA_WARNING_URL.format(area_code=area_code)
-
-    response = requests.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
-    response.raise_for_status()
-    data = response.json()
-
-    # areaTypes[0] が都道府県単位（area_codeそのもの）を含む想定
-    area_types = data.get("areaTypes") or []
-    if not area_types:
-        return []
-    areas = area_types[0].get("areas") or []
-
-    active_names: list[str] = []
-    for area in areas:
-        if area.get("code") != area_code:
-            continue
-        for warning in area.get("warnings") or []:
-            status = warning.get("status")
-            if status in _INACTIVE_STATUSES:
-                continue
-            name = _RELEVANT_WARNING_CODES.get(warning.get("code"))
-            if name and name not in active_names:
-                active_names.append(name)
-
-    if not active_names:
-        return []
-
-    names_text = "・".join(active_names)
-    return [
-        Item(
-            category="weather",
-            title="気象警報・注意報",
-            body=f"{names_text}が発表中です。台風・大雪等の場合は在宅勤務や出社時刻の見直しも検討しましょう。",
-            source="public_traffic_jma",
-            url="https://www.jma.go.jp/bosai/warning/",
-            priority=15,  # 通常の天気予報(priority=10)より優先度高め（緊急性が高いため）
-            raw={"active_warnings": active_names},
-        )
-    ]
+def load_settings() -> dict:
+    settings_path = CONFIG_DIR / "settings.yaml"
+    if not settings_path.exists():
+        return {}
+    with settings_path.open(encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
 
 
-# --- JR西日本 運行情報（大阪環状線・JR東西線） ---
+def collect_all(settings: dict) -> list[Item]:
+    """各collectorを呼び出してItemを集約する。
 
-JR_WEST_TRAFFICINFO_URL = "https://trafficinfo.westjr.co.jp/api/v1/trafficinfo.json"
-DEFAULT_JR_WEST_TARGET_LINES = ["大阪環状線", "ＪＲ東西線"]
+    collectors/base.py の方針どおり、collect()自体が内部でtry-exceptして
+    失敗時は[]を返す実装になっている想定だが、念のためここでも保護する。
 
+    TODO: internal_news.py を実装したらここに追記する（README.md 5章参照）。
+          社内システム(Selenium等)へのアクセスが必要なため、社用PC・社内ネットワーク
+          環境で別途実装する想定（このセッションでは未実装）。実装後は
+          category="news" のItemを返すようにすれば、そのままAI要約の
+          「📰 注目ニュース」に載る。
 
-def _tomorrow_jst() -> dt.date:
-    jst = dt.timezone(dt.timedelta(hours=9))
-    return (dt.datetime.now(jst) + dt.timedelta(days=1)).date()
-
-
-def _collect_jr_west(config: dict) -> list[Item]:
-    if not config.get("enabled", True):
-        return []
-
-    target_lines = config.get("target_lines", DEFAULT_JR_WEST_TARGET_LINES)
-    tomorrow_str = _tomorrow_jst().isoformat()
-
-    response = requests.get(JR_WEST_TRAFFICINFO_URL, timeout=REQUEST_TIMEOUT_SECONDS)
-    response.raise_for_status()
-    data = response.json()
-
+    ITmediaニュース（collectors/public_itmedia.py）はここには含めない。AIを経由せず
+    固定で末尾に追加する別枠のため、run() から直接呼び出す。
+    """
     items: list[Item] = []
-    for area in data.get("areaTrafficInfos") or []:
-        for daily in area.get("dailyData") or []:
-            if daily.get("date") != tomorrow_str:
-                continue
-            for place in daily.get("placeTrafficInfos") or []:
-                for line in place.get("conventionalLineTrafficInfos") or []:
-                    line_name = line.get("lineName")
-                    if line_name not in target_lines:
-                        continue
-                    for detail in line.get("conventionalLineTrafficInfoDetails") or []:
-                        items.append(_build_jr_west_item(line_name, detail))
+    collectors = [
+        ("public_weather", lambda: public_weather.collect(settings.get("weather"))),
+        ("public_traffic", lambda: public_traffic.collect(settings.get("traffic"))),
+        ("public_anniversary", lambda: public_anniversary.collect(settings.get("anniversary"))),
+        ("internal_calendar", lambda: internal_calendar.collect(settings.get("schedule"))),
+        ("internal_birthday", lambda: internal_birthday.collect(settings.get("birthday"))),
+    ]
+    for name, collect_fn in collectors:
+        try:
+            items.extend(collect_fn())
+        except Exception as exc:  # collector側の実装漏れに対する保険
+            print(f"[warn] collector '{name}' で想定外のエラー: {exc}")
     return items
 
 
-def _build_jr_west_item(line_name: str, detail: dict) -> Item:
-    condition = detail.get("conditionName") or "運行情報あり"
-    cause = detail.get("cause")
+def _format_item_text(item: Item) -> str:
+    """Itemの表示テキストを組み立てる。urlがあればMarkdownハイパーリンクにする。
 
-    section_texts = [
-        f"{sec.get('startStation')}〜{sec.get('endStation')}駅間"
-        for sec in (detail.get("sections") or [])
-        if sec.get("startStation") and sec.get("endStation")
-    ]
+    - ニュースのように title と body が実質同じ内容の場合は、本文自体をリンクにする
+      （例: "- [新型ノートPCが発表 - Example News](https://...)"）。
+    - 天気のように body が長めの文章でtitleと異なる場合は、文末に「詳細」リンクを添える
+      （例: "- 明日の大阪は「くもり」の予想です。...（[詳細](https://...)）"）。
+    """
+    if not item.url:
+        return item.body
+    if item.body.strip() == item.title.strip():
+        return f"[{item.body}]({item.url})"
+    return f"{item.body}（[詳細]({item.url})）"
 
-    detail_bits = []
-    if section_texts:
-        detail_bits.append("・".join(section_texts))
-    if cause:
-        detail_bits.append(f"原因: {cause}")
 
-    body = f"明日、{line_name}で「{condition}」の情報があります"
-    if detail_bits:
-        body += "（" + "、".join(detail_bits) + "）"
-    body += "。"
+def render_fallback_markdown(items: list[Item]) -> str:
+    """AIを使わず、Itemをカテゴリ別にそのまま並べる簡易Markdown整形。
 
-    return Item(
-        category="weather",
-        title=f"{line_name} 運行情報",
-        body=body,
-        source="public_traffic_jrwest",
-        url="https://trafficinfo.westjr.co.jp/kinki.html",
-        priority=12,
-        raw=detail,
+    AI連携がまだ設定できていない段階での動作確認や、AI呼び出し失敗時の
+    フォールバックとして使う。
+    """
+    by_category: dict[str, list[Item]] = {}
+    for item in items:
+        by_category.setdefault(item.category, []).append(item)
+
+    lines: list[str] = []
+    rendered_categories = set()
+    for category in CATEGORY_ORDER:
+        cat_items = by_category.get(category, [])
+        if not cat_items:
+            continue
+        rendered_categories.add(category)
+        lines.append(f"### {CATEGORY_LABELS.get(category, category)}")
+        for item in cat_items:
+            lines.append(f"- {_format_item_text(item)}")
+        lines.append("")
+
+    # CATEGORY_ORDER に無いカテゴリも念のため出力する
+    for category, cat_items in by_category.items():
+        if category in rendered_categories:
+            continue
+        lines.append(f"### {category}")
+        for item in cat_items:
+            lines.append(f"- {_format_item_text(item)}")
+        lines.append("")
+
+    if not lines:
+        return "(本日は収集できた情報がありませんでした)\n"
+    return "\n".join(lines).strip() + "\n"
+
+
+def render_itmedia_block(itmedia_items: list[Item]) -> str:
+    """ITmediaニュースを、AIを介さずそのままMarkdownの箇条書きブロックにする。
+
+    旧Power Automateでの「RSSフィードをそのまま配信」という運用・見た目に合わせるため、
+    要約や言い換えはせず、タイトルをそのままハイパーリンクにして並べるだけにしてある。
+    取得できなかった場合（ネットワーク不通等）は空文字列を返す（＝末尾に何も追加しない）。
+    """
+    if not itmedia_items:
+        return ""
+    lines = [ITMEDIA_HEADING]
+    for item in itmedia_items:
+        lines.append(f"- {_format_item_text(item)}")
+    return "\n".join(lines) + "\n"
+
+
+def build_prompt(items: list[Item], settings: dict) -> str:
+    """config/policy.md の方針とItem一覧から、PX-AIに渡すプロンプト文字列を組み立てる。
+
+    AI呼び出し本体（chat()）とは分離してあるので、実際に送信する前に
+    この関数の戻り値だけを確認する（= --dry-run）ことができる。
+    """
+    policy_path = CONFIG_DIR / "policy.md"
+    policy_text = policy_path.read_text(encoding="utf-8") if policy_path.exists() else ""
+
+    items_text = (
+        "\n".join(f"- [{item.category}] {_format_item_text(item)}" for item in items)
+        or "(収集できた情報はありません)"
+    )
+    return (
+        f"{policy_text}\n\n"
+        "---\n"
+        "以下は本日収集した情報です。上記の方針に沿って、社内チャット投稿用のサマリーを"
+        "Markdown形式で作成してください。各項目に既にMarkdownのハイパーリンク（[表示名](URL)の形式）が"
+        "含まれている場合は、生成するサマリーでもそのリンクをそのまま保持してください。\n\n"
+        f"{items_text}"
     )
 
 
-def collect(config: Optional[dict] = None) -> list[Item]:
-    """気象警報・注意報とJR西日本運行情報をItemとして返す（該当なしなら空リスト）。
+def render_with_ai(items: list[Item], settings: dict) -> str:
+    """config/policy.md の方針とItem一覧をAIに渡し、サマリーMarkdownを生成する。"""
+    prompt = build_prompt(items, settings)
+    return px_ai_client.chat(
+        [{"role": "user", "content": prompt}],
+        config=settings.get("ai"),
+    )
 
-    config: config/settings.yaml の `traffic` セクションを想定。
-        例: {"jma_area_code": "270000", "jr_west": {"enabled": true, "target_lines": [...]}}
 
-    JMA・JR西日本それぞれ個別にtry/exceptで保護しているため、片方が失敗しても
-    もう片方の結果は返す。両方失敗、またはconfig自体が無い場合は空リストを返す。
-    """
-    config = config or {}
-    items: list[Item] = []
+def run(dry_run: bool = False) -> Path:
+    settings = load_settings()
+    items = collect_all(settings)
+    itmedia_items = public_itmedia.collect(settings.get("itmedia"))
+    itmedia_block = render_itmedia_block(itmedia_items)
+
+    OUT_DIR.mkdir(exist_ok=True)
+    today_str = dt.date.today().strftime("%Y%m%d")
+
+    if dry_run:
+        # PX-AIには送信せず、送信予定のプロンプト文面だけを確認する。
+        # policy.md の内容やcollectorの収集結果が意図通りかを、AI呼び出し
+        # （APIキー・ネットワーク疎通が必要）に先立って確認できる。
+        # ITmediaニュースはAIに渡さない別枠なので、参考として別途表示する
+        # （こちらはネットワークさえ繋がれば今すぐ確認できる）。
+        prompt = build_prompt(items, settings)
+        prompt_path = OUT_DIR / f"prompt_{today_str}.md"
+        prompt_path.write_text(prompt, encoding="utf-8")
+        print("=== PX-AIに送信予定のプロンプト（--dry-run のため実際には送信していません） ===\n")
+        print(prompt)
+        print(f"\n=== ここまで（{prompt_path} にも保存しました） ===")
+        print("\n=== ITmediaニュース（AIには渡さず、常に末尾に固定でこのまま追加されます） ===\n")
+        print(itmedia_block if itmedia_block else "(取得できませんでした)")
+        return prompt_path
 
     try:
-        items.extend(_collect_jma_warnings(config))
-    except Exception:
-        pass
+        markdown = render_with_ai(items, settings)
+    except Exception as exc:
+        # policy.md がまだ雛形のままだったり、PX-AIのエンドポイントが未確認だったりする
+        # 現段階では失敗して当然のため、簡易フォーマットにフォールバックして動作は止めない。
+        print(f"[warn] AI要約に失敗したため、簡易フォーマットで出力します: {exc}")
+        markdown = render_fallback_markdown(items)
 
-    try:
-        items.extend(_collect_jr_west(config.get("jr_west") or {}))
-    except Exception:
-        pass
+    if itmedia_block:
+        markdown = markdown.rstrip() + "\n\n" + itmedia_block
 
-    return items
+    out_path = OUT_DIR / f"draft_{today_str}.md"
+    out_path.write_text(markdown, encoding="utf-8")
+    print(f"draftを書き出しました: {out_path}")
+    return out_path
 
 
 if __name__ == "__main__":
-    # 動作確認用: python -m collectors.public_traffic
-    for item in collect():
-        print(item)
+    parser = argparse.ArgumentParser(description="夕方サマリー自動生成アシスタント")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="PX-AIには送信せず、送信予定のプロンプト内容だけを確認する",
+    )
+    args = parser.parse_args()
+    run(dry_run=args.dry_run)
